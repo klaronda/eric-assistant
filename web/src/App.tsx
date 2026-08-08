@@ -82,6 +82,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [selected, setSelected] = useState<TaskRow | null>(null);
 
   useEffect(() => {
@@ -167,6 +168,15 @@ export default function App() {
   const refresh = useCallback(async () => {
     await Promise.all([loadTasks(), loadStatus()]);
   }, [loadTasks, loadStatus]);
+
+  const syncNow = useCallback(async () => {
+    setSyncing(true);
+    setError(null);
+    const { error: e } = await supabase.functions.invoke("sync-now", { body: {} });
+    if (e) setError(`Sync failed: ${e.message}`);
+    await refresh();
+    setSyncing(false);
+  }, [refresh]);
 
   useEffect(() => {
     if (!session) return;
@@ -314,8 +324,14 @@ export default function App() {
               Live
             </span>
           )}
-          <button className="ghost-btn" type="button" onClick={() => void refresh()}>
-            Refresh
+          <button
+            className="primary-btn compact"
+            type="button"
+            onClick={() => void syncNow()}
+            disabled={syncing}
+            title="Fetch new Gmail now and re-run triage (Quo & Slack arrive instantly on their own)"
+          >
+            {syncing ? "Syncing…" : "Sync now"}
           </button>
           <button className="ghost-btn" type="button" onClick={() => void supabase.auth.signOut()}>
             Sign out

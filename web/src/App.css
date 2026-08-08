@@ -68,6 +68,17 @@
   background: var(--lagoon-deep);
 }
 
+.primary-btn.compact {
+  padding: 0.5rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+}
+
+.primary-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .chip-btn {
   padding: 0.4rem 0.75rem;
   border-radius: 999px;

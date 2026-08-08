@@ -9,6 +9,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: "Method not allowed" }, 405);
   }
 
+  try {
   const url = new URL(req.url);
   const expected = Deno.env.get("GMAIL_INGEST_TOKEN")?.trim();
   if (expected) {
@@ -107,9 +108,14 @@ Deno.serve(async (req: Request) => {
   let tasks = 0;
 
   for (const id of messageIds.slice(0, 40)) {
-    const result = await ingestMessage(supabase, accessToken, id);
-    if (result.inserted) inserted++;
-    if (result.taskCreated) tasks++;
+    try {
+      const result = await ingestMessage(supabase, accessToken, id);
+      if (result.inserted) inserted++;
+      if (result.taskCreated) tasks++;
+    } catch (e) {
+      // Skip messages that can't be fetched (deleted/moved since history was recorded)
+      console.error("gmail ingest skipped", id, e instanceof Error ? e.message : String(e));
+    }
   }
 
   if (newHistoryId) {
@@ -127,6 +133,11 @@ Deno.serve(async (req: Request) => {
     tasks,
     historyId: newHistoryId,
   });
+  } catch (err) {
+    const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    console.error("gmail-sync error", msg);
+    return json({ error: msg }, 500);
+  }
 });
 
 async function refreshAccessToken(
