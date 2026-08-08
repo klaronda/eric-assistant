@@ -11,7 +11,8 @@ select cron.schedule(
   '*/30 * * * *',
   $$
   select net.http_post(
-    url := 'https://hyujjndlzbsntcdourkh.supabase.co/functions/v1/gmail-sync?token=cc7f7f734481ed5cae19c3d602e1d7df9a0a3908f2de0c7b',
+    -- Replace YOUR_GMAIL_INGEST_TOKEN with the live secret (do not commit real tokens)
+    url := 'https://hyujjndlzbsntcdourkh.supabase.co/functions/v1/gmail-sync?token=YOUR_GMAIL_INGEST_TOKEN',
     headers := jsonb_build_object(
       'Content-Type', 'application/json'
     ),
