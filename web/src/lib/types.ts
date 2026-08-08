@@ -1,6 +1,7 @@
 export type Channel = "quo" | "slack" | "gmail";
 export type ContactTag = "business" | "dump" | "unknown";
 export type TaskStatus = "open" | "snoozed" | "done" | "ignored";
+export type TaskCategory = "needs_reply" | "fyi" | "junk";
 
 export type TaskRow = {
   id: string;
@@ -8,14 +9,30 @@ export type TaskRow = {
   summary: string | null;
   channel: Channel | null;
   urgency: number | null;
+  category: TaskCategory | null;
+  triaged_at: string | null;
   status: TaskStatus;
+  snooze_until: string | null;
   created_at: string;
   contact_id: string | null;
+  source_message_id: string | null;
   contacts: {
     id: string;
     display_name: string | null;
     tag: ContactTag;
   } | null;
+};
+
+export type MessageRow = {
+  id: string;
+  channel: Channel;
+  direction: "inbound" | "outbound";
+  subject: string | null;
+  body: string;
+  from_identity: string | null;
+  to_identity: string | null;
+  external_thread_id: string | null;
+  received_at: string;
 };
 
 export type ChannelStatus = {

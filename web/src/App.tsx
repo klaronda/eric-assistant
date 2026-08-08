@@ -2,15 +2,31 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
-import type { Channel, ChannelStatus, ContactTag, TaskRow } from "./lib/types";
+import type {
+  Channel,
+  ChannelStatus,
+  ContactTag,
+  MessageRow,
+  TaskCategory,
+  TaskRow,
+} from "./lib/types";
 import "./App.css";
 
 type Filter = "all" | Channel;
+type BucketKey = "now" | "today" | "week" | "fyi" | "junk";
 
 const CHANNELS: { id: Channel; label: string }[] = [
   { id: "quo", label: "Quo" },
   { id: "slack", label: "Slack" },
   { id: "gmail", label: "Gmail" },
+];
+
+const GROUPS: { key: BucketKey; label: string; hint?: string }[] = [
+  { key: "now", label: "Now", hint: "Urgent — handle today" },
+  { key: "today", label: "Today" },
+  { key: "week", label: "This week" },
+  { key: "fyi", label: "FYI", hint: "No reply needed" },
+  { key: "junk", label: "Junk" },
 ];
 
 function minutesAgo(iso: string | null): number | null {
@@ -34,8 +50,16 @@ function channelOk(channel: Channel, lastAt: string | null, gmailSyncAt: string 
     return mins !== null && mins <= 45;
   }
   const mins = minutesAgo(lastAt);
-  // Webhooks can be quiet; green if we've ever seen data and not stale > 7 days
   return mins !== null && mins <= 60 * 24 * 7;
+}
+
+function bucketOf(t: TaskRow): BucketKey {
+  if (t.category === "junk") return "junk";
+  if (t.category === "fyi") return "fyi";
+  const u = t.urgency ?? 5;
+  if (u >= 8) return "now";
+  if (u >= 5) return "today";
+  return "week";
 }
 
 export default function App() {
@@ -47,6 +71,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState(false);
+  const [selected, setSelected] = useState<TaskRow | null>(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -78,11 +103,7 @@ export default function App() {
         .maybeSingle(),
     ]);
 
-    const latest: Record<Channel, string | null> = {
-      quo: null,
-      slack: null,
-      gmail: null,
-    };
+    const latest: Record<Channel, string | null> = { quo: null, slack: null, gmail: null };
     for (const row of (messages ?? []) as Array<{
       channel: Channel;
       created_at: string;
@@ -107,13 +128,7 @@ export default function App() {
         if (id === "gmail") {
           detail = `${connectedEmail} · sync ${formatFreshness(gmailSyncAt ?? oauthRow?.updated_at ?? null)}`;
         }
-        return {
-          channel: id,
-          label,
-          lastAt,
-          detail,
-          ok,
-        };
+        return { channel: id, label, lastAt, detail, ok };
       }),
     );
   }, []);
@@ -121,12 +136,13 @@ export default function App() {
   const loadTasks = useCallback(async () => {
     setLoading(true);
     setError(null);
+    const nowIso = new Date().toISOString();
     const { data, error: qError } = await supabase
       .from("tasks")
       .select(
-        "id, title, summary, channel, urgency, status, created_at, contact_id, contacts(id, display_name, tag)",
+        "id, title, summary, channel, urgency, category, triaged_at, status, snooze_until, created_at, contact_id, source_message_id, contacts(id, display_name, tag)",
       )
-      .eq("status", "open")
+      .or(`status.eq.open,and(status.eq.snoozed,snooze_until.lte.${nowIso})`)
       .order("urgency", { ascending: false, nullsFirst: false })
       .order("created_at", { ascending: false });
 
@@ -149,64 +165,86 @@ export default function App() {
 
     const channel = supabase
       .channel("eric-dashboard")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "tasks" },
-        () => {
-          void refresh();
-        },
-      )
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "messages" },
-        () => {
-          void loadStatus();
-        },
-      )
-      .subscribe((status) => {
-        setLive(status === "SUBSCRIBED");
-      });
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, () => {
+        void loadTasks();
+      })
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, () => {
+        void loadStatus();
+      })
+      .subscribe((status) => setLive(status === "SUBSCRIBED"));
 
-    const poll = window.setInterval(() => {
-      void loadStatus();
-    }, 60_000);
+    const poll = window.setInterval(() => void loadStatus(), 60_000);
 
     return () => {
       void supabase.removeChannel(channel);
       window.clearInterval(poll);
     };
-  }, [session, refresh, loadStatus]);
+  }, [session, refresh, loadTasks, loadStatus]);
 
   const visibleTasks = useMemo(() => {
     if (filter === "all") return tasks;
     return tasks.filter((t) => t.channel === filter);
   }, [tasks, filter]);
 
+  const grouped = useMemo(() => {
+    const map: Record<BucketKey, TaskRow[]> = {
+      now: [],
+      today: [],
+      week: [],
+      fyi: [],
+      junk: [],
+    };
+    for (const t of visibleTasks) map[bucketOf(t)].push(t);
+    return map;
+  }, [visibleTasks]);
+
+  const untriagedCount = useMemo(
+    () => tasks.filter((t) => !t.triaged_at).length,
+    [tasks],
+  );
+
+  function removeTask(id: string) {
+    setTasks((prev) => prev.filter((t) => t.id !== id));
+    setSelected((cur) => (cur?.id === id ? null : cur));
+  }
+
   async function markDone(id: string) {
-    const { error: upError } = await supabase
+    const { error: e } = await supabase
       .from("tasks")
       .update({ status: "done", completed_at: new Date().toISOString() })
       .eq("id", id);
-    if (upError) {
-      setError(upError.message);
-      return;
-    }
-    setTasks((prev) => prev.filter((t) => t.id !== id));
+    if (e) return setError(e.message);
+    removeTask(id);
+  }
+
+  async function ignoreTask(id: string) {
+    const { error: e } = await supabase.from("tasks").update({ status: "ignored" }).eq("id", id);
+    if (e) return setError(e.message);
+    removeTask(id);
+  }
+
+  async function snoozeTask(id: string, until: Date) {
+    const { error: e } = await supabase
+      .from("tasks")
+      .update({ status: "snoozed", snooze_until: until.toISOString() })
+      .eq("id", id);
+    if (e) return setError(e.message);
+    removeTask(id);
   }
 
   async function setContactTag(contactId: string | null, tag: ContactTag) {
     if (!contactId) return;
-    const { error: upError } = await supabase.from("contacts").update({ tag }).eq("id", contactId);
-    if (upError) {
-      setError(upError.message);
-      return;
-    }
+    const { error: e } = await supabase.from("contacts").update({ tag }).eq("id", contactId);
+    if (e) return setError(e.message);
     setTasks((prev) =>
       prev.map((t) =>
-        t.contact_id === contactId && t.contacts
-          ? { ...t, contacts: { ...t.contacts, tag } }
-          : t,
+        t.contact_id === contactId && t.contacts ? { ...t, contacts: { ...t.contacts, tag } } : t,
       ),
+    );
+    setSelected((cur) =>
+      cur && cur.contact_id === contactId && cur.contacts
+        ? { ...cur, contacts: { ...cur.contacts, tag } }
+        : cur,
     );
   }
 
@@ -222,14 +260,16 @@ export default function App() {
     return <AuthScreen onSignedIn={() => void refresh()} />;
   }
 
+  const totalOpen = visibleTasks.length;
+
   return (
     <div className="app">
       <header className="topbar">
         <div>
           <h1 className="brand">Eric Assistant</h1>
-          <p className="subtitle">Open requests from Quo, Slack, and Gmail — one list.</p>
+          <p className="subtitle">Triaged requests from Quo, Slack, and Gmail — sorted by what matters.</p>
         </div>
-        <div style={{ display: "flex", gap: "0.6rem", alignItems: "center" }}>
+        <div className="topbar-actions">
           {live && (
             <span className="live-pill">
               <span className="pulse" />
@@ -239,11 +279,7 @@ export default function App() {
           <button className="ghost-btn" type="button" onClick={() => void refresh()}>
             Refresh
           </button>
-          <button
-            className="ghost-btn"
-            type="button"
-            onClick={() => void supabase.auth.signOut()}
-          >
+          <button className="ghost-btn" type="button" onClick={() => void supabase.auth.signOut()}>
             Sign out
           </button>
         </div>
@@ -256,7 +292,10 @@ export default function App() {
             <article key={s.channel} className="status-card">
               <div className="row">
                 <span className="name">{s.label}</span>
-                <span className={`dot ${s.ok ? "ok" : "warn"}`} title={s.ok ? "Connected" : "Quiet / check"} />
+                <span
+                  className={`dot ${s.ok ? "ok" : "warn"}`}
+                  title={s.ok ? "Connected" : "Quiet / check"}
+                />
               </div>
               <p className="detail">{s.detail}</p>
             </article>
@@ -279,65 +318,313 @@ export default function App() {
             ))}
           </div>
           <span className="meta">
-            {loading ? "Loading…" : `${visibleTasks.length} open`}
+            {loading ? "Loading…" : `${totalOpen} open`}
+            {untriagedCount > 0 && !loading ? ` · ${untriagedCount} triaging…` : ""}
           </span>
         </div>
 
         {error && <p className="auth error">{error}</p>}
 
-        {!loading && visibleTasks.length === 0 ? (
+        {!loading && totalOpen === 0 ? (
           <div className="empty">Nothing open in this filter. You’re clear.</div>
         ) : (
-          <div className="task-list">
-            {visibleTasks.map((task) => (
-              <article key={task.id} className="task">
-                <div className="task-top">
-                  <div>
-                    <h3 className="task-title">{task.title}</h3>
-                    {task.summary && <p className="task-summary">{task.summary}</p>}
+          <div className="groups">
+            {GROUPS.map((g) => {
+              const items = grouped[g.key];
+              if (!items || items.length === 0) return null;
+              return (
+                <div key={g.key} className={`group group-${g.key}`}>
+                  <div className="group-head">
+                    <span className="group-label">{g.label}</span>
+                    <span className="group-count">{items.length}</span>
+                    {g.hint && <span className="group-hint">{g.hint}</span>}
                   </div>
-                  <div className="badges">
-                    {task.channel && (
-                      <span className={`badge ${task.channel}`}>{task.channel}</span>
-                    )}
-                    {task.urgency != null && (
-                      <span className="badge">u{task.urgency}</span>
-                    )}
-                    {task.contacts?.tag && (
-                      <span className="badge">{task.contacts.tag}</span>
-                    )}
+                  <div className="task-list">
+                    {items.map((task) => (
+                      <TaskCard
+                        key={task.id}
+                        task={task}
+                        onOpen={() => setSelected(task)}
+                        onDone={() => void markDone(task.id)}
+                      />
+                    ))}
                   </div>
                 </div>
-                <div className="task-actions">
-                  <span className="meta">
-                    {task.contacts?.display_name || "Unknown"} ·{" "}
-                    {new Date(task.created_at).toLocaleString()}
-                  </span>
-                  <select
-                    aria-label="Contact tag"
-                    value={task.contacts?.tag ?? "unknown"}
-                    onChange={(e) =>
-                      void setContactTag(task.contact_id, e.target.value as ContactTag)
-                    }
-                    disabled={!task.contact_id}
-                  >
-                    <option value="unknown">unknown</option>
-                    <option value="business">business</option>
-                    <option value="dump">dump</option>
-                  </select>
-                  <button
-                    type="button"
-                    className="chip-btn done"
-                    onClick={() => void markDone(task.id)}
-                  >
-                    Mark done
-                  </button>
-                </div>
-              </article>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
+
+      {selected && (
+        <TaskDrawer
+          task={selected}
+          onClose={() => setSelected(null)}
+          onDone={() => void markDone(selected.id)}
+          onIgnore={() => void ignoreTask(selected.id)}
+          onSnooze={(until) => void snoozeTask(selected.id, until)}
+          onTag={(tag) => void setContactTag(selected.contact_id, tag)}
+        />
+      )}
+    </div>
+  );
+}
+
+function TaskCard({
+  task,
+  onOpen,
+  onDone,
+}: {
+  task: TaskRow;
+  onOpen: () => void;
+  onDone: () => void;
+}) {
+  return (
+    <article className="task" onClick={onOpen} role="button" tabIndex={0}
+      onKeyDown={(e) => (e.key === "Enter" ? onOpen() : undefined)}>
+      <div className="task-top">
+        <div className="task-main">
+          <h3 className="task-title">{task.title}</h3>
+          {task.summary && <p className="task-summary">{task.summary}</p>}
+        </div>
+        <div className="badges">
+          {task.channel && <span className={`badge ${task.channel}`}>{task.channel}</span>}
+          {task.category && <CategoryBadge category={task.category} />}
+          {task.urgency != null && <span className="badge urgency">u{task.urgency}</span>}
+          {!task.triaged_at && <span className="badge triaging">triaging…</span>}
+        </div>
+      </div>
+      <div className="task-actions" onClick={(e) => e.stopPropagation()}>
+        <span className="meta">
+          {task.contacts?.display_name || "Unknown"} · {formatFreshness(task.created_at)}
+        </span>
+        <div className="task-actions-right">
+          <button type="button" className="chip-btn" onClick={onOpen}>
+            Open
+          </button>
+          <button type="button" className="chip-btn done" onClick={onDone}>
+            Done
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function CategoryBadge({ category }: { category: TaskCategory }) {
+  const label =
+    category === "needs_reply" ? "needs reply" : category === "fyi" ? "FYI" : "junk";
+  return <span className={`badge cat-${category}`}>{label}</span>;
+}
+
+function TaskDrawer({
+  task,
+  onClose,
+  onDone,
+  onIgnore,
+  onSnooze,
+  onTag,
+}: {
+  task: TaskRow;
+  onClose: () => void;
+  onDone: () => void;
+  onIgnore: () => void;
+  onSnooze: (until: Date) => void;
+  onTag: (tag: ContactTag) => void;
+}) {
+  const [message, setMessage] = useState<MessageRow | null>(null);
+  const [thread, setThread] = useState<MessageRow[]>([]);
+  const [loadingMsg, setLoadingMsg] = useState(true);
+  const [draft, setDraft] = useState<string>("");
+  const [drafting, setDrafting] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    setLoadingMsg(true);
+    setMessage(null);
+    setThread([]);
+    setDraft("");
+    setDraftError(null);
+
+    async function load() {
+      if (!task.source_message_id) {
+        if (active) setLoadingMsg(false);
+        return;
+      }
+      const { data: msg } = await supabase
+        .from("messages")
+        .select(
+          "id, channel, direction, subject, body, from_identity, to_identity, external_thread_id, received_at",
+        )
+        .eq("id", task.source_message_id)
+        .maybeSingle();
+
+      if (!active) return;
+      const m = (msg ?? null) as MessageRow | null;
+      setMessage(m);
+
+      if (m?.external_thread_id) {
+        const { data: threadRows } = await supabase
+          .from("messages")
+          .select(
+            "id, channel, direction, subject, body, from_identity, to_identity, external_thread_id, received_at",
+          )
+          .eq("channel", m.channel)
+          .eq("external_thread_id", m.external_thread_id)
+          .order("received_at", { ascending: true })
+          .limit(20);
+        if (active) setThread((threadRows ?? []) as MessageRow[]);
+      }
+      setLoadingMsg(false);
+    }
+
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [task.id, task.source_message_id]);
+
+  async function generateDraft() {
+    setDrafting(true);
+    setDraftError(null);
+    const { data, error } = await supabase.functions.invoke("ai-draft", {
+      body: { task_id: task.id },
+    });
+    setDrafting(false);
+    if (error) {
+      setDraftError(error.message);
+      return;
+    }
+    setDraft((data as { draft?: string })?.draft ?? "");
+  }
+
+  async function copyDraft() {
+    try {
+      await navigator.clipboard.writeText(draft);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setDraftError("Couldn't copy to clipboard");
+    }
+  }
+
+  const now = new Date();
+  const tonight = new Date(now);
+  tonight.setHours(18, 0, 0, 0);
+  if (tonight <= now) tonight.setDate(tonight.getDate() + 1);
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  tomorrow.setHours(9, 0, 0, 0);
+  const nextWeek = new Date(now);
+  nextWeek.setDate(now.getDate() + 7);
+  nextWeek.setHours(9, 0, 0, 0);
+
+  return (
+    <div className="drawer-overlay" onClick={onClose}>
+      <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+        <div className="drawer-head">
+          <div className="badges">
+            {task.channel && <span className={`badge ${task.channel}`}>{task.channel}</span>}
+            {task.category && <CategoryBadge category={task.category} />}
+            {task.urgency != null && <span className="badge urgency">u{task.urgency}</span>}
+          </div>
+          <button type="button" className="ghost-btn" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        <h2 className="drawer-title">{task.title}</h2>
+        {task.summary && <p className="drawer-summary">{task.summary}</p>}
+
+        <div className="drawer-meta">
+          <span>{task.contacts?.display_name || message?.from_identity || "Unknown"}</span>
+          <select
+            aria-label="Contact tag"
+            value={task.contacts?.tag ?? "unknown"}
+            onChange={(e) => onTag(e.target.value as ContactTag)}
+            disabled={!task.contact_id}
+          >
+            <option value="unknown">unknown</option>
+            <option value="business">business</option>
+            <option value="dump">dump</option>
+          </select>
+        </div>
+
+        <div className="drawer-section">
+          <h3>Message</h3>
+          {loadingMsg ? (
+            <p className="meta">Loading message…</p>
+          ) : message ? (
+            <div className="message-block">
+              {message.subject && <p className="msg-subject">{message.subject}</p>}
+              <p className="msg-body">{message.body || "(no body)"}</p>
+              <p className="meta">{new Date(message.received_at).toLocaleString()}</p>
+            </div>
+          ) : (
+            <p className="meta">No linked message.</p>
+          )}
+        </div>
+
+        {thread.length > 1 && (
+          <div className="drawer-section">
+            <h3>Thread</h3>
+            <div className="thread">
+              {thread.map((m) => (
+                <div key={m.id} className={`thread-msg ${m.direction}`}>
+                  <span className="thread-who">{m.direction === "outbound" ? "Eric" : "Them"}</span>
+                  <p>{m.body || "(no body)"}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="drawer-section">
+          <div className="row-between">
+            <h3>Reply draft</h3>
+            <button type="button" className="chip-btn" onClick={() => void generateDraft()} disabled={drafting}>
+              {drafting ? "Drafting…" : draft ? "Regenerate" : "Draft with AI"}
+            </button>
+          </div>
+          {draftError && <p className="error">{draftError}</p>}
+          {draft && (
+            <div className="draft-block">
+              <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={6} />
+              <div className="row-between">
+                <span className="meta">Review before sending — nothing sends automatically.</span>
+                <button type="button" className="chip-btn done" onClick={() => void copyDraft()}>
+                  {copied ? "Copied!" : "Copy"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="drawer-actions">
+          <div className="snooze-row">
+            <span className="meta">Snooze:</span>
+            <button type="button" className="chip-btn" onClick={() => onSnooze(tonight)}>
+              Tonight
+            </button>
+            <button type="button" className="chip-btn" onClick={() => onSnooze(tomorrow)}>
+              Tomorrow
+            </button>
+            <button type="button" className="chip-btn" onClick={() => onSnooze(nextWeek)}>
+              Next week
+            </button>
+          </div>
+          <div className="primary-row">
+            <button type="button" className="chip-btn ghost" onClick={onIgnore}>
+              Ignore
+            </button>
+            <button type="button" className="chip-btn done" onClick={onDone}>
+              Mark done
+            </button>
+          </div>
+        </div>
+      </aside>
     </div>
   );
 }
