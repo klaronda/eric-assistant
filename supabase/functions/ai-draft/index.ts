@@ -12,8 +12,8 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
-  const openaiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!openaiKey) return json({ error: "OPENAI_API_KEY not set" }, 500);
+  const openaiKey = Deno.env.get("OPENAI_API_KEY") ?? Deno.env.get("OPEN_AI_SECRET");
+  if (!openaiKey) return json({ error: "OPENAI_API_KEY / OPEN_AI_SECRET not set" }, 500);
 
   let body: { task_id?: string; guidance?: string };
   try {

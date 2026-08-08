@@ -15,8 +15,8 @@ Deno.serve(async (req: Request) => {
   const authError = authorize(req);
   if (authError) return json({ error: authError }, 401);
 
-  const openaiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!openaiKey) return json({ error: "OPENAI_API_KEY not set" }, 500);
+  const openaiKey = Deno.env.get("OPENAI_API_KEY") ?? Deno.env.get("OPEN_AI_SECRET");
+  if (!openaiKey) return json({ error: "OPENAI_API_KEY / OPEN_AI_SECRET not set" }, 500);
 
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
