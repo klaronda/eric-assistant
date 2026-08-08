@@ -13,6 +13,7 @@ export type TaskRow = {
   triaged_at: string | null;
   status: TaskStatus;
   snooze_until: string | null;
+  position: number;
   created_at: string;
   contact_id: string | null;
   source_message_id: string | null;

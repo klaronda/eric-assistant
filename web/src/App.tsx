@@ -1,6 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Session } from "@supabase/supabase-js";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import type { DragEndEvent } from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { supabase } from "./lib/supabase";
 import type {
   Channel,
@@ -13,20 +30,12 @@ import type {
 import "./App.css";
 
 type Filter = "all" | Channel;
-type BucketKey = "now" | "today" | "week" | "fyi" | "junk";
+type UrgencyLevel = "high" | "med" | "low";
 
 const CHANNELS: { id: Channel; label: string }[] = [
   { id: "quo", label: "Quo" },
   { id: "slack", label: "Slack" },
   { id: "gmail", label: "Gmail" },
-];
-
-const GROUPS: { key: BucketKey; label: string; hint?: string }[] = [
-  { key: "now", label: "Now", hint: "Urgent — handle today" },
-  { key: "today", label: "Today" },
-  { key: "week", label: "This week" },
-  { key: "fyi", label: "FYI", hint: "No reply needed" },
-  { key: "junk", label: "Junk" },
 ];
 
 function minutesAgo(iso: string | null): number | null {
@@ -41,7 +50,7 @@ function formatFreshness(iso: string | null): string {
   if (mins < 60) return `${mins} min ago`;
   const hours = Math.round(mins / 60);
   if (hours < 48) return `${hours}h ago`;
-  return new Date(iso!).toLocaleString();
+  return new Date(iso!).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function channelOk(channel: Channel, lastAt: string | null, gmailSyncAt: string | null): boolean {
@@ -53,13 +62,15 @@ function channelOk(channel: Channel, lastAt: string | null, gmailSyncAt: string 
   return mins !== null && mins <= 60 * 24 * 7;
 }
 
-function bucketOf(t: TaskRow): BucketKey {
-  if (t.category === "junk") return "junk";
-  if (t.category === "fyi") return "fyi";
-  const u = t.urgency ?? 5;
-  if (u >= 8) return "now";
-  if (u >= 5) return "today";
-  return "week";
+function urgencyLevel(u: number | null): UrgencyLevel {
+  const v = u ?? 5;
+  if (v >= 8) return "high";
+  if (v >= 5) return "med";
+  return "low";
+}
+
+function urgencyLabel(level: UrgencyLevel): string {
+  return level === "high" ? "Now" : level === "med" ? "Today" : "Later";
 }
 
 export default function App() {
@@ -78,9 +89,7 @@ export default function App() {
       setSession(data.session);
       setAuthReady(true);
     });
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
-      setSession(next);
-    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
     return () => sub.subscription.unsubscribe();
   }, []);
 
@@ -140,10 +149,10 @@ export default function App() {
     const { data, error: qError } = await supabase
       .from("tasks")
       .select(
-        "id, title, summary, channel, urgency, category, triaged_at, status, snooze_until, created_at, contact_id, source_message_id, contacts(id, display_name, tag)",
+        "id, title, summary, channel, urgency, category, triaged_at, status, snooze_until, position, created_at, contact_id, source_message_id, contacts(id, display_name, tag)",
       )
       .or(`status.eq.open,and(status.eq.snoozed,snooze_until.lte.${nowIso})`)
-      .order("urgency", { ascending: false, nullsFirst: false })
+      .order("position", { ascending: true })
       .order("created_at", { ascending: false });
 
     if (qError) {
@@ -174,38 +183,41 @@ export default function App() {
       .subscribe((status) => setLive(status === "SUBSCRIBED"));
 
     const poll = window.setInterval(() => void loadStatus(), 60_000);
-
     return () => {
       void supabase.removeChannel(channel);
       window.clearInterval(poll);
     };
   }, [session, refresh, loadTasks, loadStatus]);
 
-  const visibleTasks = useMemo(() => {
+  const filtered = useMemo(() => {
     if (filter === "all") return tasks;
     return tasks.filter((t) => t.channel === filter);
   }, [tasks, filter]);
 
-  const grouped = useMemo(() => {
-    const map: Record<BucketKey, TaskRow[]> = {
-      now: [],
-      today: [],
-      week: [],
-      fyi: [],
-      junk: [],
-    };
-    for (const t of visibleTasks) map[bucketOf(t)].push(t);
-    return map;
-  }, [visibleTasks]);
+  const priority = useMemo(
+    () =>
+      filtered
+        .filter((t) => t.category !== "fyi" && t.category !== "junk")
+        .sort((a, b) => a.position - b.position),
+    [filtered],
+  );
+  const fyi = useMemo(() => filtered.filter((t) => t.category === "fyi"), [filtered]);
+  const junk = useMemo(() => filtered.filter((t) => t.category === "junk"), [filtered]);
+  const untriagedCount = useMemo(() => tasks.filter((t) => !t.triaged_at).length, [tasks]);
 
-  const untriagedCount = useMemo(
-    () => tasks.filter((t) => !t.triaged_at).length,
-    [tasks],
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
   function removeTask(id: string) {
     setTasks((prev) => prev.filter((t) => t.id !== id));
     setSelected((cur) => (cur?.id === id ? null : cur));
+  }
+
+  function patchTask(id: string, patch: Partial<TaskRow>) {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+    setSelected((cur) => (cur?.id === id ? { ...cur, ...patch } : cur));
   }
 
   async function markDone(id: string) {
@@ -248,6 +260,35 @@ export default function App() {
     );
   }
 
+  async function setCategory(id: string, category: TaskCategory) {
+    patchTask(id, { category });
+    const { error: e } = await supabase.from("tasks").update({ category }).eq("id", id);
+    if (e) setError(e.message);
+  }
+
+  async function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = priority.findIndex((t) => t.id === active.id);
+    const newIndex = priority.findIndex((t) => t.id === over.id);
+    if (oldIndex < 0 || newIndex < 0) return;
+
+    const reordered = arrayMove(priority, oldIndex, newIndex);
+    const prev = reordered[newIndex - 1];
+    const next = reordered[newIndex + 1];
+    let newPos: number;
+    if (!prev) newPos = (next ? next.position : 1) - 1;
+    else if (!next) newPos = prev.position + 1;
+    else newPos = (prev.position + next.position) / 2;
+
+    patchTask(String(active.id), { position: newPos });
+    const { error: e } = await supabase
+      .from("tasks")
+      .update({ position: newPos })
+      .eq("id", active.id);
+    if (e) setError(e.message);
+  }
+
   if (!authReady) {
     return (
       <div className="app">
@@ -255,19 +296,16 @@ export default function App() {
       </div>
     );
   }
+  if (!session) return <AuthScreen onSignedIn={() => void refresh()} />;
 
-  if (!session) {
-    return <AuthScreen onSignedIn={() => void refresh()} />;
-  }
-
-  const totalOpen = visibleTasks.length;
+  const canDrag = filter === "all";
 
   return (
     <div className="app">
       <header className="topbar">
         <div>
           <h1 className="brand">Eric Assistant</h1>
-          <p className="subtitle">Triaged requests from Quo, Slack, and Gmail — sorted by what matters.</p>
+          <p className="subtitle">Your requests from Quo, Slack &amp; Gmail — triaged and in one place.</p>
         </div>
         <div className="topbar-actions">
           {live && (
@@ -285,21 +323,21 @@ export default function App() {
         </div>
       </header>
 
-      <section className="panel">
-        <h2>Connections</h2>
-        <div className="status-grid">
-          {statuses.map((s) => (
-            <article key={s.channel} className="status-card">
-              <div className="row">
-                <span className="name">{s.label}</span>
-                <span
-                  className={`dot ${s.ok ? "ok" : "warn"}`}
-                  title={s.ok ? "Connected" : "Quiet / check"}
-                />
-              </div>
-              <p className="detail">{s.detail}</p>
-            </article>
-          ))}
+      <Legend />
+      <HowTo />
+
+      <section className="panel connections">
+        <div className="connections-row">
+          <span className="panel-eyebrow">Connections</span>
+          <div className="conn-chips">
+            {statuses.map((s) => (
+              <span key={s.channel} className="conn-chip" title={s.detail}>
+                <span className={`dot ${s.ok ? "ok" : "warn"}`} />
+                {s.label}
+                <span className="conn-detail">{s.detail}</span>
+              </span>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -318,43 +356,84 @@ export default function App() {
             ))}
           </div>
           <span className="meta">
-            {loading ? "Loading…" : `${totalOpen} open`}
+            {loading ? "Loading…" : `${priority.length} to handle`}
             {untriagedCount > 0 && !loading ? ` · ${untriagedCount} triaging…` : ""}
           </span>
         </div>
 
-        {error && <p className="auth error">{error}</p>}
+        {error && <p className="error">{error}</p>}
 
-        {!loading && totalOpen === 0 ? (
-          <div className="empty">Nothing open in this filter. You’re clear.</div>
+        {!loading && priority.length === 0 ? (
+          <div className="empty">Nothing to handle right now. You’re clear. 🌊</div>
+        ) : canDrag ? (
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={priority.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+              <div className="list">
+                {priority.map((task) => (
+                  <SortableTaskCard
+                    key={task.id}
+                    task={task}
+                    onOpen={() => setSelected(task)}
+                    onDone={() => void markDone(task.id)}
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          </DndContext>
         ) : (
-          <div className="groups">
-            {GROUPS.map((g) => {
-              const items = grouped[g.key];
-              if (!items || items.length === 0) return null;
-              return (
-                <div key={g.key} className={`group group-${g.key}`}>
-                  <div className="group-head">
-                    <span className="group-label">{g.label}</span>
-                    <span className="group-count">{items.length}</span>
-                    {g.hint && <span className="group-hint">{g.hint}</span>}
-                  </div>
-                  <div className="task-list">
-                    {items.map((task) => (
-                      <TaskCard
-                        key={task.id}
-                        task={task}
-                        onOpen={() => setSelected(task)}
-                        onDone={() => void markDone(task.id)}
-                      />
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
+          <div className="list">
+            {priority.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                onOpen={() => setSelected(task)}
+                onDone={() => void markDone(task.id)}
+              />
+            ))}
+            <p className="meta drag-note">Switch to “All” to drag and reorder.</p>
           </div>
         )}
       </section>
+
+      {fyi.length > 0 && (
+        <details className="panel section">
+          <summary>
+            <span className="section-title">FYI</span>
+            <span className="section-count">{fyi.length}</span>
+            <span className="section-hint">Informational — no reply needed</span>
+          </summary>
+          <div className="list compact">
+            {fyi.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                onOpen={() => setSelected(task)}
+                onDone={() => void markDone(task.id)}
+              />
+            ))}
+          </div>
+        </details>
+      )}
+
+      {junk.length > 0 && (
+        <details className="panel section muted">
+          <summary>
+            <span className="section-title">Junk</span>
+            <span className="section-count">{junk.length}</span>
+            <span className="section-hint">Marketing, spam, automated</span>
+          </summary>
+          <div className="list compact">
+            {junk.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                onOpen={() => setSelected(task)}
+                onDone={() => void markDone(task.id)}
+              />
+            ))}
+          </div>
+        </details>
+      )}
 
       {selected && (
         <TaskDrawer
@@ -364,13 +443,77 @@ export default function App() {
           onIgnore={() => void ignoreTask(selected.id)}
           onSnooze={(until) => void snoozeTask(selected.id, until)}
           onTag={(tag) => void setContactTag(selected.contact_id, tag)}
+          onCategory={(c) => void setCategory(selected.id, c)}
         />
       )}
     </div>
   );
 }
 
-function TaskCard({
+function Legend() {
+  return (
+    <div className="legend">
+      <div className="legend-group">
+        <span className="legend-label">Priority</span>
+        <span className="legend-item">
+          <span className="swatch high" /> Now
+        </span>
+        <span className="legend-item">
+          <span className="swatch med" /> Today
+        </span>
+        <span className="legend-item">
+          <span className="swatch low" /> Later
+        </span>
+      </div>
+      <div className="legend-group">
+        <span className="legend-label">Channels</span>
+        <span className="legend-item">
+          <span className="badge quo">Quo</span> texts
+        </span>
+        <span className="legend-item">
+          <span className="badge slack">Slack</span>
+        </span>
+        <span className="legend-item">
+          <span className="badge gmail">Gmail</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function HowTo() {
+  return (
+    <details className="panel howto">
+      <summary>
+        <span className="howto-icon">?</span> How to use this
+      </summary>
+      <ul className="howto-list">
+        <li>
+          <strong>Top list = what to handle.</strong> Sorted by AI priority. Drag the{" "}
+          <span className="handle-inline">⠿</span> handle to reorder however you like.
+        </li>
+        <li>
+          <strong>Click any task</strong> to read the full message, see the thread, and draft a
+          reply with AI (nothing sends automatically — you copy it).
+        </li>
+        <li>
+          <strong>Snooze</strong> hides a task until later, <strong>Done</strong> clears it, and{" "}
+          <strong>Ignore</strong> dismisses it for good.
+        </li>
+        <li>
+          <strong>FYI</strong> and <strong>Junk</strong> are tucked below — open them anytime. In a
+          task you can move it between Needs&nbsp;reply / FYI / Junk.
+        </li>
+        <li>
+          New texts, Slack messages, and emails show up on their own and get triaged within a couple
+          minutes.
+        </li>
+      </ul>
+    </details>
+  );
+}
+
+function SortableTaskCard({
   task,
   onOpen,
   onDone,
@@ -379,41 +522,73 @@ function TaskCard({
   onOpen: () => void;
   onDone: () => void;
 }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: task.id,
+  });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.6 : 1,
+    zIndex: isDragging ? 10 : undefined,
+  };
   return (
-    <article className="task" onClick={onOpen} role="button" tabIndex={0}
-      onKeyDown={(e) => (e.key === "Enter" ? onOpen() : undefined)}>
-      <div className="task-top">
-        <div className="task-main">
-          <h3 className="task-title">{task.title}</h3>
-          {task.summary && <p className="task-summary">{task.summary}</p>}
-        </div>
-        <div className="badges">
+    <TaskCard
+      task={task}
+      onOpen={onOpen}
+      onDone={onDone}
+      dragRef={setNodeRef}
+      dragStyle={style}
+      handleProps={{ ...attributes, ...listeners }}
+    />
+  );
+}
+
+function TaskCard({
+  task,
+  onOpen,
+  onDone,
+  dragRef,
+  dragStyle,
+  handleProps,
+}: {
+  task: TaskRow;
+  onOpen: () => void;
+  onDone: () => void;
+  dragRef?: (el: HTMLElement | null) => void;
+  dragStyle?: React.CSSProperties;
+  handleProps?: React.HTMLAttributes<HTMLButtonElement>;
+}) {
+  const level = urgencyLevel(task.urgency);
+  return (
+    <article ref={dragRef} style={dragStyle} className={`tcard ${level}`}>
+      {handleProps && (
+        <button type="button" className="drag-handle" aria-label="Drag to reorder" {...handleProps}>
+          ⠿
+        </button>
+      )}
+      <button type="button" className="tcard-body" onClick={onOpen}>
+        <div className="tcard-line">
+          <h3 className="tcard-title">{task.title}</h3>
           {task.channel && <span className={`badge ${task.channel}`}>{task.channel}</span>}
-          {task.category && <CategoryBadge category={task.category} />}
-          {task.urgency != null && <span className="badge urgency">u{task.urgency}</span>}
-          {!task.triaged_at && <span className="badge triaging">triaging…</span>}
         </div>
-      </div>
-      <div className="task-actions" onClick={(e) => e.stopPropagation()}>
-        <span className="meta">
-          {task.contacts?.display_name || "Unknown"} · {formatFreshness(task.created_at)}
-        </span>
-        <div className="task-actions-right">
-          <button type="button" className="chip-btn" onClick={onOpen}>
-            Open
-          </button>
-          <button type="button" className="chip-btn done" onClick={onDone}>
-            Done
-          </button>
+        {task.summary && <p className="tcard-summary">{task.summary}</p>}
+        <div className="tcard-meta">
+          <span className={`prio ${level}`}>{urgencyLabel(level)}</span>
+          <span>{task.contacts?.display_name || "Unknown"}</span>
+          <span>·</span>
+          <span>{formatFreshness(task.created_at)}</span>
+          {!task.triaged_at && <span className="triaging">triaging…</span>}
         </div>
-      </div>
+      </button>
+      <button type="button" className="tcard-done" title="Mark done" onClick={onDone}>
+        ✓
+      </button>
     </article>
   );
 }
 
 function CategoryBadge({ category }: { category: TaskCategory }) {
-  const label =
-    category === "needs_reply" ? "needs reply" : category === "fyi" ? "FYI" : "junk";
+  const label = category === "needs_reply" ? "needs reply" : category === "fyi" ? "FYI" : "junk";
   return <span className={`badge cat-${category}`}>{label}</span>;
 }
 
@@ -424,6 +599,7 @@ function TaskDrawer({
   onIgnore,
   onSnooze,
   onTag,
+  onCategory,
 }: {
   task: TaskRow;
   onClose: () => void;
@@ -431,11 +607,12 @@ function TaskDrawer({
   onIgnore: () => void;
   onSnooze: (until: Date) => void;
   onTag: (tag: ContactTag) => void;
+  onCategory: (c: TaskCategory) => void;
 }) {
   const [message, setMessage] = useState<MessageRow | null>(null);
   const [thread, setThread] = useState<MessageRow[]>([]);
   const [loadingMsg, setLoadingMsg] = useState(true);
-  const [draft, setDraft] = useState<string>("");
+  const [draft, setDraft] = useState("");
   const [drafting, setDrafting] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -493,10 +670,7 @@ function TaskDrawer({
       body: { task_id: task.id },
     });
     setDrafting(false);
-    if (error) {
-      setDraftError(error.message);
-      return;
-    }
+    if (error) return setDraftError(error.message);
     setDraft((data as { draft?: string })?.draft ?? "");
   }
 
@@ -521,6 +695,12 @@ function TaskDrawer({
   nextWeek.setDate(now.getDate() + 7);
   nextWeek.setHours(9, 0, 0, 0);
 
+  const cats: { key: TaskCategory; label: string }[] = [
+    { key: "needs_reply", label: "Needs reply" },
+    { key: "fyi", label: "FYI" },
+    { key: "junk", label: "Junk" },
+  ];
+
   return (
     <div className="drawer-overlay" onClick={onClose}>
       <aside className="drawer" onClick={(e) => e.stopPropagation()}>
@@ -528,7 +708,7 @@ function TaskDrawer({
           <div className="badges">
             {task.channel && <span className={`badge ${task.channel}`}>{task.channel}</span>}
             {task.category && <CategoryBadge category={task.category} />}
-            {task.urgency != null && <span className="badge urgency">u{task.urgency}</span>}
+            {task.urgency != null && <span className="badge urgency">urgency {task.urgency}</span>}
           </div>
           <button type="button" className="ghost-btn" onClick={onClose}>
             Close
@@ -550,6 +730,22 @@ function TaskDrawer({
             <option value="business">business</option>
             <option value="dump">dump</option>
           </select>
+        </div>
+
+        <div className="drawer-section">
+          <h3>Classify</h3>
+          <div className="seg">
+            {cats.map((c) => (
+              <button
+                key={c.key}
+                type="button"
+                className={`seg-btn ${task.category === c.key ? "active" : ""}`}
+                onClick={() => onCategory(c.key)}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="drawer-section">
@@ -584,7 +780,12 @@ function TaskDrawer({
         <div className="drawer-section">
           <div className="row-between">
             <h3>Reply draft</h3>
-            <button type="button" className="chip-btn" onClick={() => void generateDraft()} disabled={drafting}>
+            <button
+              type="button"
+              className="chip-btn"
+              onClick={() => void generateDraft()}
+              disabled={drafting}
+            >
               {drafting ? "Drafting…" : draft ? "Regenerate" : "Draft with AI"}
             </button>
           </div>
@@ -646,10 +847,7 @@ function AuthScreen({ onSignedIn }: { onSignedIn: () => void }) {
         : supabase.auth.signUp({ email, password });
     const { error: authError } = await action;
     setBusy(false);
-    if (authError) {
-      setError(authError.message);
-      return;
-    }
+    if (authError) return setError(authError.message);
     onSignedIn();
   }
 
