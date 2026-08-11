@@ -39,15 +39,37 @@ import "./App.css";
 type Filter = "all" | Channel;
 type UrgencyLevel = "high" | "med" | "low";
 
-type Recap = {
-  newByChannel: Record<Channel, number>;
+type RecapStats = {
   newTotal: number;
+  newByChannel: Record<Channel, number>;
   needsReply: number;
   urgent: number;
   handled: number;
   autoReplies: number;
-  generatedAt: string;
 };
+
+type RecapNeedsItem = {
+  title: string;
+  contact: string;
+  urgency: number;
+  channel: Channel | null;
+};
+
+type Recap = {
+  generatedAt: string;
+  summary: string;
+  stats: RecapStats;
+  needsReply: RecapNeedsItem[];
+  fyi: number;
+  junk: number;
+};
+
+function greetingForNow(): string {
+  const h = new Date().getHours();
+  if (h < 12) return "Good morning";
+  if (h < 17) return "Good afternoon";
+  return "Good evening";
+}
 
 const CHANNELS: { id: Channel; label: string }[] = [
   { id: "quo", label: "Quo" },
@@ -187,42 +209,9 @@ export default function App() {
 
   const loadRecap = useCallback(async () => {
     setRecapLoading(true);
-    const since = new Date(Date.now() - 24 * 3600_000).toISOString();
-    const [msgs, newTasks, handled, autoReplies] = await Promise.all([
-      supabase
-        .from("messages")
-        .select("channel")
-        .eq("direction", "inbound")
-        .gte("received_at", since),
-      supabase.from("tasks").select("category, urgency").gte("created_at", since),
-      supabase
-        .from("tasks")
-        .select("id", { count: "exact", head: true })
-        .eq("status", "done")
-        .gte("completed_at", since),
-      supabase
-        .from("auto_responses")
-        .select("id", { count: "exact", head: true })
-        .gte("created_at", since),
-    ]);
-
-    const newByChannel: Record<Channel, number> = { quo: 0, slack: 0, gmail: 0 };
-    for (const row of (msgs.data ?? []) as Array<{ channel: Channel }>) {
-      if (row.channel in newByChannel) newByChannel[row.channel] += 1;
-    }
-    const tasksRows = (newTasks.data ?? []) as Array<{
-      category: TaskCategory | null;
-      urgency: number | null;
-    }>;
-    setRecap({
-      newByChannel,
-      newTotal: (msgs.data ?? []).length,
-      needsReply: tasksRows.filter((t) => t.category === "needs_reply" || !t.category).length,
-      urgent: tasksRows.filter((t) => (t.urgency ?? 0) >= 8).length,
-      handled: handled.count ?? 0,
-      autoReplies: autoReplies.count ?? 0,
-      generatedAt: new Date().toISOString(),
-    });
+    const { data, error: e } = await supabase.functions.invoke("recap", { body: {} });
+    if (e) setError(`Recap failed: ${e.message}`);
+    else if (data) setRecap(data as Recap);
     setRecapLoading(false);
   }, []);
 
@@ -255,8 +244,8 @@ export default function App() {
   );
 
   const refresh = useCallback(async () => {
-    await Promise.all([loadTasks(), loadStatus(), loadRecap(), loadSettings()]);
-  }, [loadTasks, loadStatus, loadRecap, loadSettings]);
+    await Promise.all([loadTasks(), loadStatus(), loadSettings()]);
+  }, [loadTasks, loadStatus, loadSettings]);
 
   const syncNow = useCallback(async () => {
     setSyncing(true);
@@ -270,6 +259,7 @@ export default function App() {
   useEffect(() => {
     if (!session) return;
     void refresh();
+    void loadRecap();
 
     const channel = supabase
       .channel("eric-dashboard")
@@ -286,7 +276,7 @@ export default function App() {
       void supabase.removeChannel(channel);
       window.clearInterval(poll);
     };
-  }, [session, refresh, loadTasks, loadStatus]);
+  }, [session, refresh, loadTasks, loadStatus, loadRecap]);
 
   const filtered = useMemo(() => {
     if (filter === "all") return tasks;
@@ -568,13 +558,17 @@ function RecapBanner({
   loading: boolean;
   onRefresh: () => void;
 }) {
-  const stats: { label: string; value: number; tone?: string }[] = recap
+  const chips: { label: string; value: number; tone?: string }[] = recap
     ? [
-        { label: "new requests", value: recap.newTotal },
-        { label: "need reply", value: recap.needsReply, tone: "amber" },
-        { label: "urgent", value: recap.urgent, tone: recap.urgent > 0 ? "red" : undefined },
-        { label: "handled", value: recap.handled, tone: "green" },
-        { label: "auto-replies", value: recap.autoReplies },
+        { label: "new requests", value: recap.stats.newTotal },
+        { label: "need reply", value: recap.stats.needsReply, tone: "amber" },
+        {
+          label: "urgent",
+          value: recap.stats.urgent,
+          tone: recap.stats.urgent > 0 ? "red" : undefined,
+        },
+        { label: "handled", value: recap.stats.handled, tone: "green" },
+        { label: "auto-replies", value: recap.stats.autoReplies },
       ]
     : [];
 
@@ -586,7 +580,7 @@ function RecapBanner({
           <p className="recap-sub">
             {recap
               ? `Updated ${formatFreshness(recap.generatedAt)}`
-              : "Your activity at a glance"}
+              : "Your daily briefing"}
           </p>
         </div>
         <button
@@ -598,25 +592,63 @@ function RecapBanner({
           {loading ? "Refreshing…" : "Refresh"}
         </button>
       </div>
-      {recap ? (
-        <div className="recap-stats">
-          {stats.map((s) => (
-            <div key={s.label} className={`recap-stat ${s.tone ?? ""}`}>
-              <span className="recap-num">{s.value}</span>
-              <span className="recap-label">{s.label}</span>
-            </div>
-          ))}
-          <div className="recap-channels">
-            {(["quo", "slack", "gmail"] as Channel[]).map((c) => (
-              <span key={c} className="recap-chan">
-                <span className={`badge ${c}`}>{c}</span>
-                {recap.newByChannel[c]}
-              </span>
-            ))}
-          </div>
-        </div>
+
+      {!recap ? (
+        <p className="meta">{loading ? "Writing your recap…" : "No activity yet."}</p>
       ) : (
-        <p className="meta">{loading ? "Loading recap…" : "No activity yet."}</p>
+        <>
+          <p className="recap-greeting">
+            {greetingForNow()}, Eric.
+          </p>
+          <p className="recap-summary">{recap.summary}</p>
+
+          <div className="recap-stats">
+            {chips.map((s) => (
+              <div key={s.label} className={`recap-stat ${s.tone ?? ""}`}>
+                <span className="recap-num">{s.value}</span>
+                <span className="recap-label">{s.label}</span>
+              </div>
+            ))}
+            <div className="recap-channels">
+              {(["quo", "slack", "gmail"] as Channel[]).map((c) => (
+                <span key={c} className="recap-chan">
+                  <span className={`badge ${c}`}>{c}</span>
+                  {recap.stats.newByChannel[c] ?? 0}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {recap.needsReply.length > 0 && (
+            <div className="recap-section">
+              <span className="recap-section-title">Needs your reply</span>
+              <ul className="recap-list">
+                {recap.needsReply.map((item, i) => (
+                  <li key={i}>
+                    <span className="recap-item-title">{item.title}</span>
+                    <span className="recap-item-meta">
+                      {item.channel && <span className={`badge ${item.channel}`}>{item.channel}</span>}
+                      <span>{item.contact}</span>
+                      {item.urgency >= 8 && <span className="recap-tag urgent">time-sensitive</span>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="recap-footnotes">
+            <span>
+              <strong>{recap.stats.handled}</strong> handled for you
+            </span>
+            <span>
+              <strong>{recap.stats.autoReplies}</strong> auto-replied while out
+            </span>
+            <span>
+              <strong>{recap.fyi}</strong> FYI · <strong>{recap.junk}</strong> junk filed
+            </span>
+          </div>
+        </>
       )}
     </section>
   );
