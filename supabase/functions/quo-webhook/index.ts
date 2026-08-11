@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { maybeAutoRespond } from "../_shared/autorespond.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -120,7 +121,24 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  return json({ ok: true, eventType, messageId, contactId, taskId });
+  let autoResponse: Record<string, unknown> | undefined;
+  if (parsed.direction === "inbound") {
+    try {
+      autoResponse = await maybeAutoRespond(supabase, {
+        channel: "quo",
+        contactId,
+        inboundMessageId: messageId ?? null,
+        sender: parsed.fromIdentity,
+        recipient: parsed.toIdentity,
+        threadId: parsed.externalThreadId,
+        body: parsed.body,
+      });
+    } catch (e) {
+      console.error("auto-respond error", e);
+    }
+  }
+
+  return json({ ok: true, eventType, messageId, contactId, taskId, autoResponse });
 });
 
 function authorize(req: Request): string | null {

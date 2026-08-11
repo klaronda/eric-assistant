@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { maybeAutoRespond } from "../_shared/autorespond.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -167,7 +168,24 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  return json({ ok: true, messageId, contactId, taskId });
+  let autoResponse: Record<string, unknown> | undefined;
+  if (eventType === "message") {
+    try {
+      autoResponse = await maybeAutoRespond(supabase, {
+        channel: "slack",
+        contactId,
+        inboundMessageId: messageId ?? null,
+        sender: userId,
+        recipient: channelId,
+        threadId: `${channelId}:${threadTs}`,
+        body: text,
+      });
+    } catch (e) {
+      console.error("auto-respond error", e);
+    }
+  }
+
+  return json({ ok: true, messageId, contactId, taskId, autoResponse });
 });
 
 function checkIngestToken(req: Request): string | null {

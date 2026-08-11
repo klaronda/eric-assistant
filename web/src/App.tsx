@@ -27,10 +27,27 @@ import type {
   TaskCategory,
   TaskRow,
 } from "./lib/types";
+import {
+  CUSTOM_SCAFFOLD,
+  DEFAULT_SETTINGS,
+  PRESETS,
+  previewMessage,
+} from "./lib/autoresponder";
+import type { AutoResponderSettings, Preset } from "./lib/autoresponder";
 import "./App.css";
 
 type Filter = "all" | Channel;
 type UrgencyLevel = "high" | "med" | "low";
+
+type Recap = {
+  newByChannel: Record<Channel, number>;
+  newTotal: number;
+  needsReply: number;
+  urgent: number;
+  handled: number;
+  autoReplies: number;
+  generatedAt: string;
+};
 
 const CHANNELS: { id: Channel; label: string }[] = [
   { id: "quo", label: "Quo" },
@@ -84,6 +101,9 @@ export default function App() {
   const [live, setLive] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [selected, setSelected] = useState<TaskRow | null>(null);
+  const [recap, setRecap] = useState<Recap | null>(null);
+  const [recapLoading, setRecapLoading] = useState(false);
+  const [settings, setSettings] = useState<AutoResponderSettings>(DEFAULT_SETTINGS);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -165,9 +185,78 @@ export default function App() {
     setLoading(false);
   }, []);
 
+  const loadRecap = useCallback(async () => {
+    setRecapLoading(true);
+    const since = new Date(Date.now() - 24 * 3600_000).toISOString();
+    const [msgs, newTasks, handled, autoReplies] = await Promise.all([
+      supabase
+        .from("messages")
+        .select("channel")
+        .eq("direction", "inbound")
+        .gte("received_at", since),
+      supabase.from("tasks").select("category, urgency").gte("created_at", since),
+      supabase
+        .from("tasks")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "done")
+        .gte("completed_at", since),
+      supabase
+        .from("auto_responses")
+        .select("id", { count: "exact", head: true })
+        .gte("created_at", since),
+    ]);
+
+    const newByChannel: Record<Channel, number> = { quo: 0, slack: 0, gmail: 0 };
+    for (const row of (msgs.data ?? []) as Array<{ channel: Channel }>) {
+      if (row.channel in newByChannel) newByChannel[row.channel] += 1;
+    }
+    const tasksRows = (newTasks.data ?? []) as Array<{
+      category: TaskCategory | null;
+      urgency: number | null;
+    }>;
+    setRecap({
+      newByChannel,
+      newTotal: (msgs.data ?? []).length,
+      needsReply: tasksRows.filter((t) => t.category === "needs_reply" || !t.category).length,
+      urgent: tasksRows.filter((t) => (t.urgency ?? 0) >= 8).length,
+      handled: handled.count ?? 0,
+      autoReplies: autoReplies.count ?? 0,
+      generatedAt: new Date().toISOString(),
+    });
+    setRecapLoading(false);
+  }, []);
+
+  const loadSettings = useCallback(async () => {
+    const { data } = await supabase
+      .from("autoresponder_settings")
+      .select("enabled, preset, custom_message, respond_quo, respond_slack, cooldown_hours")
+      .eq("id", true)
+      .maybeSingle();
+    if (data) setSettings(data as AutoResponderSettings);
+  }, []);
+
+  const saveSettings = useCallback(
+    async (next: AutoResponderSettings) => {
+      setSettings(next);
+      const { error: e } = await supabase
+        .from("autoresponder_settings")
+        .update({
+          enabled: next.enabled,
+          preset: next.preset,
+          custom_message: next.custom_message,
+          respond_quo: next.respond_quo,
+          respond_slack: next.respond_slack,
+          cooldown_hours: next.cooldown_hours,
+        })
+        .eq("id", true);
+      if (e) setError(e.message);
+    },
+    [],
+  );
+
   const refresh = useCallback(async () => {
-    await Promise.all([loadTasks(), loadStatus()]);
-  }, [loadTasks, loadStatus]);
+    await Promise.all([loadTasks(), loadStatus(), loadRecap(), loadSettings()]);
+  }, [loadTasks, loadStatus, loadRecap, loadSettings]);
 
   const syncNow = useCallback(async () => {
     setSyncing(true);
@@ -339,6 +428,10 @@ export default function App() {
         </div>
       </header>
 
+      <RecapBanner recap={recap} loading={recapLoading} onRefresh={() => void loadRecap()} />
+
+      <AutoResponderPanel settings={settings} onSave={(s) => void saveSettings(s)} />
+
       <Legend />
       <HowTo />
 
@@ -463,6 +556,200 @@ export default function App() {
         />
       )}
     </div>
+  );
+}
+
+function RecapBanner({
+  recap,
+  loading,
+  onRefresh,
+}: {
+  recap: Recap | null;
+  loading: boolean;
+  onRefresh: () => void;
+}) {
+  const stats: { label: string; value: number; tone?: string }[] = recap
+    ? [
+        { label: "new requests", value: recap.newTotal },
+        { label: "need reply", value: recap.needsReply, tone: "amber" },
+        { label: "urgent", value: recap.urgent, tone: recap.urgent > 0 ? "red" : undefined },
+        { label: "handled", value: recap.handled, tone: "green" },
+        { label: "auto-replies", value: recap.autoReplies },
+      ]
+    : [];
+
+  return (
+    <section className="panel recap">
+      <div className="recap-head">
+        <div>
+          <span className="panel-eyebrow">Last 24 hours</span>
+          <p className="recap-sub">
+            {recap
+              ? `Updated ${formatFreshness(recap.generatedAt)}`
+              : "Your activity at a glance"}
+          </p>
+        </div>
+        <button
+          className="ghost-btn compact"
+          type="button"
+          onClick={onRefresh}
+          disabled={loading}
+        >
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+      {recap ? (
+        <div className="recap-stats">
+          {stats.map((s) => (
+            <div key={s.label} className={`recap-stat ${s.tone ?? ""}`}>
+              <span className="recap-num">{s.value}</span>
+              <span className="recap-label">{s.label}</span>
+            </div>
+          ))}
+          <div className="recap-channels">
+            {(["quo", "slack", "gmail"] as Channel[]).map((c) => (
+              <span key={c} className="recap-chan">
+                <span className={`badge ${c}`}>{c}</span>
+                {recap.newByChannel[c]}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="meta">{loading ? "Loading recap…" : "No activity yet."}</p>
+      )}
+    </section>
+  );
+}
+
+function AutoResponderPanel({
+  settings,
+  onSave,
+}: {
+  settings: AutoResponderSettings;
+  onSave: (s: AutoResponderSettings) => void;
+}) {
+  const preview = previewMessage(settings);
+
+  function update(patch: Partial<AutoResponderSettings>) {
+    onSave({ ...settings, ...patch });
+  }
+
+  function selectPreset(preset: Preset) {
+    if (preset === "custom" && !settings.custom_message) {
+      onSave({ ...settings, preset, custom_message: CUSTOM_SCAFFOLD });
+    } else {
+      onSave({ ...settings, preset });
+    }
+  }
+
+  return (
+    <details className="panel autoresp" open={settings.enabled}>
+      <summary>
+        <span className="section-title">Auto-reply</span>
+        <span className={`ar-state ${settings.enabled ? "on" : "off"}`}>
+          {settings.enabled ? "ON" : "OFF"}
+        </span>
+        <span className="section-hint">
+          Acknowledge texts &amp; Slack DMs when you&apos;re heads-down
+        </span>
+      </summary>
+
+      <div className="ar-body">
+        <label className="ar-toggle">
+          <input
+            type="checkbox"
+            checked={settings.enabled}
+            onChange={(e) => update({ enabled: e.target.checked })}
+          />
+          <span>
+            <strong>{settings.enabled ? "Auto-reply is on" : "Auto-reply is off"}</strong>
+            <span className="meta">
+              {settings.enabled
+                ? "New senders get one courteous acknowledgment."
+                : "Turn on to reply automatically. Off is safe for testing."}
+            </span>
+          </span>
+        </label>
+
+        {settings.enabled && (
+          <p className="ar-live-note">
+            Live: each person gets one auto-reply, then not again for{" "}
+            {settings.cooldown_hours}h. Replies with “URGENT” jump to the top of your list.
+          </p>
+        )}
+
+        <div className="ar-field">
+          <span className="ar-label">Message</span>
+          <div className="ar-presets">
+            {PRESETS.map((p) => (
+              <button
+                key={p.key}
+                type="button"
+                className={`ar-preset ${settings.preset === p.key ? "active" : ""}`}
+                onClick={() => selectPreset(p.key)}
+              >
+                <span className="ar-preset-label">{p.label}</span>
+                <span className="ar-preset-hint">{p.hint}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {settings.preset === "custom" && (
+          <div className="ar-field">
+            <span className="ar-label">Custom message</span>
+            <textarea
+              className="ar-custom"
+              rows={3}
+              value={settings.custom_message ?? ""}
+              placeholder={CUSTOM_SCAFFOLD}
+              onChange={(e) => update({ custom_message: e.target.value })}
+            />
+            <span className="meta">
+              Keep <code>[paraphrase request]</code> where you want the AI to summarize their ask.
+            </span>
+          </div>
+        )}
+
+        <div className="ar-field">
+          <span className="ar-label">Preview</span>
+          <div className="ar-preview">{preview}</div>
+        </div>
+
+        <div className="ar-options">
+          <span className="ar-label">Respond on</span>
+          <label className="ar-check">
+            <input
+              type="checkbox"
+              checked={settings.respond_quo}
+              onChange={(e) => update({ respond_quo: e.target.checked })}
+            />
+            <span className="badge quo">Quo</span> texts
+          </label>
+          <label className="ar-check">
+            <input
+              type="checkbox"
+              checked={settings.respond_slack}
+              onChange={(e) => update({ respond_slack: e.target.checked })}
+            />
+            <span className="badge slack">Slack</span> DMs
+          </label>
+          <label className="ar-cooldown">
+            Once per person every
+            <select
+              value={settings.cooldown_hours}
+              onChange={(e) => update({ cooldown_hours: Number(e.target.value) })}
+            >
+              <option value={1}>1h</option>
+              <option value={4}>4h</option>
+              <option value={8}>8h</option>
+              <option value={24}>24h</option>
+            </select>
+          </label>
+        </div>
+      </div>
+    </details>
   );
 }
 
